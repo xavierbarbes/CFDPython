@@ -1,0 +1,424 @@
+import numpy as np
+import math as math
+import matplotlib.pyplot as plt
+import scipy.linalg
+from scipy.linalg import lu
+from matplotlib.colors import ListedColormap
+from matplotlib import colors
+
+
+
+#discretization
+L_x = 2*np.pi
+L_y = np.pi/2
+N_x = 16
+N_y = 4
+Nodes_x = N_x + 1
+Nodes_y = N_y + 1
+
+h = L_x/N_x
+
+#discretized coordinate systems
+x_values = np.linspace(0.0, L_x, Nodes_x)
+y_values = np.linspace(0.0, L_y, Nodes_y)
+X_grid, Y_grid = np.meshgrid(x_values, y_values)
+position_field = np.dstack((X_grid, Y_grid))
+
+position_transpose = np.transpose(position_field, axes=(1, 0, 2))
+position_flat = position_transpose.reshape(-1,2)
+
+#Cylinder coordinates
+R = 0.25
+x_c = np.pi/4
+y_c = np.pi/4
+
+#Navier-Stokes equation constant parameters
+VISCOSITY = 0.1
+PENALIZATION = 0.001
+timestep = 0.1
+t_final = 6
+epsilon = 2*h
+
+#Initial conditions
+U_infinity = np.array([3,0])
+U_field_initial = np.full((Nodes_y, Nodes_x, 2), U_infinity)
+
+U_field_initial_x = U_field_initial[:,:,0]
+U_field_initial_y = U_field_initial[:,:,1]
+
+
+
+
+#print(U_field_initial_x)
+#print(U_field_initial_y)
+
+
+# Basic operations
+
+def flatten_vector_field(field):
+    field_transpose = np.transpose(field, axes=(1, 0, 2))
+    flat_field = field_transpose.reshape(-1,2)
+
+    return flat_field
+
+def unflatten_vector_field(flat_field):
+
+    flat_x = flat_field[:,0]
+    flat_y = flat_field[:,1]
+    field_x = flat_x.reshape((Nodes_y,Nodes_x))
+    field_y = flat_y.reshape((Nodes_y,Nodes_x))
+
+    field = np.stack((field_x, field_y), axis=-1)  # Shape: (3, 9, 2)
+    
+    return field
+    
+def central_diff_x(scalar_field): # both the right and left ahnd side are 0
+    f = scalar_field
+    diff = np.zeros_like(f)
+    for j in range (Nodes_y):
+        for i in range (1, Nodes_x-1):
+            diff[j,i] = (f[j,i+1]-f[j,i-1])/(2*h)
+    return diff
+
+
+
+
+
+def central_diff_y(scalar_field):
+    f = scalar_field
+
+    diff = np.zeros_like(f)
+    for j in range (Nodes_y):
+        for i in range (Nodes_x):
+            if j == 0 :
+                diff[0,i] = (f[1,i]-f[N_y-1,i])/(2*h)
+            elif j == (Nodes_y-1) :
+                diff[N_y,i] = (f[1,i]-f[N_y-1,i])/(2*h)
+            else :
+                diff[j,i] = (f[j+1,i]-f[j-1,i])/(2*h)
+            
+    return(diff)
+
+def form_c_field_x(scalar_field_x, scalar_field_y, D1_field_x, D2_field_x):
+
+    D1_x = D1_field_x
+    D2_x = D2_field_x
+    u = scalar_field_x
+    v = scalar_field_y
+
+    c_field_x = np.zeros_like(scalar_field_x)
+
+    for j in range (Nodes_y):
+        
+        for i in range (1, (Nodes_x - 1)):
+            c_field_x[j,i] += (((u[j,i])/timestep) - (D1_x[j,i] * u[j,i] + D2_x[j,i] * v[j,i]))
+
+    c_field_x[:,0] = U_infinity[0]
+    c_field_x[:,Nodes_x-1] = U_infinity[0]
+
+    return c_field_x
+
+def form_c_field_y(scalar_field_x, scalar_field_y, D1_field_y, D2_field_y):
+
+    D1_y = D1_field_y
+    D2_y = D2_field_y
+    u = scalar_field_x
+    v = scalar_field_y
+
+    c_field_y = np.zeros_like(scalar_field_x)
+
+    for j in range (Nodes_y):
+        for i in range (1, (Nodes_x-1)):
+            c_field_y[j,i] = (((v[j,i])/timestep) - (D1_y[j,i] * u[j,i] + D2_y[j,i] * v[j,i]))
+
+    c_field_y[:,0] = U_infinity[1]
+    c_field_y[:,Nodes_x-1] = U_infinity[1]
+
+    return c_field_y
+
+def laplace(f):
+    diff = np.zeros_like(f)
+    for j in range (1,N_y):
+        for i in range (1, N_x):
+            diff[j,i] = (f[j,i+1]+f[j,i-1]+f[j+1,i]+f[j-1,i]-4*f[j,i])/(h**2)
+            
+            #periodic BCs
+            diff[0,i] = (f[0,i+1]+f[0,i-1]+f[1,i]+f[N_y-1,i]-4*f[0,i])/(h**2)
+            diff[N_y,i] = (f[N_y,i+1]+f[N_y,i-1]+f[1,i]+f[N_y-1,i]-4*f[N_y,i])/(h**2)
+ 
+    return(diff)
+
+
+
+
+
+#plotting
+
+def plotchi():
+    
+    #vectorize the function to work with numpy arrays
+    X_vectorized = np.vectorize(chi_fct)
+
+    #create a meshgrid of x and y values
+    x_vals = np.linspace(0, L_x, N_x)
+    y_vals = np.linspace(0, L_y, N_y)
+    X_grid, Y_grid = np.meshgrid(x_vals, y_vals)
+    Z = X_vectorized(X_grid, Y_grid)
+
+    #plot the 2D filled contour
+    plt.figure(figsize=(8, 6))
+    contour = plt.contourf(X_grid, Y_grid, Z, levels=50, cmap='viridis')
+    plt.colorbar(contour, label='$chi(x,y)$')
+    plt.title('2D Plot of $chi(x, y)$')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.gca().set_aspect('equal', adjustable='box')  #ensure equal aspect ratio
+    plt.show()
+
+def plot_vector_field(field):
+
+    rows, cols, _ = field.shape
+
+    # Create meshgrid for the coordinates
+    X, Y = np.meshgrid(np.arange(cols), np.arange(rows))
+
+    # Split the vectors into U (x-components) and V (y-components)
+    U = field[:, :, 0]
+    V = field[:, :, 1]
+    
+    # Plot using quiver
+    plt.figure(figsize=(8, 6))
+    plt.quiver(X, Y, U, V, angles='xy')
+    plt.gca().invert_yaxis()  # Optional: put origin at top-left like a matrix
+    plt.title("Vector Field")
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+def plot_flat_vector_field(field):
+    """
+    Plots a 1D vector field from a (n, 2) matrix,
+    where each row is a 2D vector [x, y].
+    """
+    n = field.shape[0]
+
+    # X positions for each vector
+    X = np.arange(n)
+    Y = np.zeros(n)
+
+    # Extract components
+    U = field[:, 0]  # x-component of vector
+    V = field[:, 1]  # y-component of vector
+
+    # Plot using quiver
+    plt.figure(figsize=(12, 2))
+    plt.quiver(X, Y, U, V, angles='xy', scale_units='xy', scale=1)
+    plt.title("1D Vector Field")
+    plt.xlabel("Index")
+    plt.ylabel("Vector Direction")
+    plt.grid(True)
+    plt.axis('equal')
+    plt.ylim(-max(abs(V)) * 1.2 - 1e-5, max(abs(V)) * 1.2 + 1e-5)  # Nice Y range
+    plt.show()
+
+def plot_matrix(matrix, title="Matrix", cmap='viridis'):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(matrix, cmap=cmap, aspect='auto')
+    plt.colorbar(label='Value')
+    plt.title(title)
+    plt.xlabel("Columns")
+    plt.ylabel("Rows")
+    plt.grid(False)
+    plt.show()
+
+def plot_matrix_2(matrix, title="Matrix", cmap='viridis'):
+    matrix = np.array(matrix)
+    
+    # Create a masked array where 0s are masked (we’ll assign gray to those)
+    masked_matrix = np.ma.masked_where(matrix == 0, matrix)
+    
+    # Get the base colormap
+    base_cmap = plt.get_cmap(cmap)
+    
+    # Create a new colormap with gray for masked values
+    cmap_with_gray = base_cmap
+    cmap_with_gray.set_bad(color='gray')
+    
+    plt.figure(figsize=(10, 8))
+    im = plt.imshow(masked_matrix, cmap=cmap_with_gray, aspect='auto')
+    plt.colorbar(im, label='Value')
+    plt.title(title)
+    plt.xlabel("Columns")
+    plt.ylabel("Rows")
+    plt.grid(False)
+    plt.show()
+
+
+#functions called at the start
+
+b_entry = - VISCOSITY/(h**2)
+
+def d_fct(x, y):
+    return np.sqrt((x-x_c)**2+(y-y_c)**2)-R
+
+def chi_fct(x, y):
+    dist = d_fct(x, y)
+    if dist <= -epsilon:
+        return 1
+    elif dist >= epsilon:
+        return 0
+    else:
+        return 1/(1+np.e**((-4*dist*epsilon)/(dist**2-epsilon**2)))
+ 
+def a_fct(x, y):
+    chi = chi_fct(x,y)
+    a_entry = (1 / timestep
+         + chi / PENALIZATION
+         + 4 * VISCOSITY / (h**2))
+    return a_entry
+
+def form_matrix_A():
+
+    A = np.zeros(((Nodes_x*Nodes_y), (Nodes_x*Nodes_y)))
+
+    for i in range (Nodes_x*Nodes_y):
+        
+        x = position_flat[i][0]
+        y = position_flat[i][1]
+        
+        a_entry = a_fct(x,y)
+
+        if i in range (Nodes_y):
+            A[i][i] += 1
+        elif i in range (Nodes_x*Nodes_y - Nodes_y, Nodes_x*Nodes_y):
+            A[i][i] += 1
+        else :
+            A[i][i] += a_entry
+            A[i][i-Nodes_y] += b_entry
+            A[i][i+Nodes_y] += b_entry
+
+            if i % Nodes_y == 0:
+                A[i][i+1] += b_entry
+                A[i][i+Nodes_y-2] += b_entry
+            elif (i+1) % Nodes_y == 0:
+                A[i][i-1] += b_entry
+                A[i][i-Nodes_y+2] += b_entry
+            else:
+                A[i][i+1] += b_entry
+                A[i][i-1] += b_entry
+
+    return A
+
+
+
+# LU decomposition
+
+
+    n = A.shape[0]
+    L = np.eye(n)
+    U = np.zeros((n, n))
+
+    # LU Decomposition (Doolittle's method)
+    for i in range(n):
+        for j in range(i, n):  # U
+            U[i, j] = A[i, j] - np.sum(L[i, :i] * U[:i, j])
+        for j in range(i+1, n):  # L
+            L[j, i] = (A[j, i] - np.sum(L[j, :i] * U[:i, i])) / U[i, i]
+
+    # Forward substitution: Lc = b
+    c = np.zeros(n)
+    for i in range(n):
+        c[i] = b[i] - np.dot(L[i, :i], c[:i])
+
+    # Backward substitution: Ux = c
+    x = np.zeros(n)
+    for i in reversed(range(n)):
+        x[i] = (c[i] - np.dot(U[i, i+1:], x[i+1:])) / U[i, i]
+
+    return L, U, c, x
+
+#NEWWWWWWW
+
+def lu_decomposition(A):
+    n = A.shape[0]
+    L = np.eye(n)
+    U = np.zeros((n, n))
+
+    for i in range(n):
+        for j in range(i, n):  # U
+            U[i, j] = A[i, j] - np.sum(L[i, :i] * U[:i, j])
+        for j in range(i + 1, n):  # L
+            L[j, i] = (A[j, i] - np.sum(L[j, :i] * U[:i, i])) / U[i, i]
+
+    return L, U
+
+def forward_substitution(L, b):
+    n = L.shape[0]
+    c = np.zeros(n)
+    for i in range(n):
+        c[i] = b[i] - np.dot(L[i, :i], c[:i])
+    return c
+
+def backward_substitution(U, c):
+    n = U.shape[0]
+    x = np.zeros(n)
+    for i in reversed(range(n)):
+        x[i] = (c[i] - np.dot(U[i, i+1:], x[i+1:])) / U[i, i]
+    return x
+
+
+
+
+def iteration():
+
+    t = 0
+    
+    U_field_x = U_field_initial_x
+    U_field_y = U_field_initial_y
+
+    A = form_matrix_A()
+    L, U = lu_decomposition(A)
+
+
+    while t <= 6:
+
+        D1_x = central_diff_x(U_field_x)    
+        D1_y = central_diff_x(U_field_y)
+        D2_x = central_diff_y(U_field_x)
+        D2_y = central_diff_y(U_field_y)
+
+        c_field_x = form_c_field_x(U_field_x, U_field_y, D1_x, D2_x)
+        c_field_y = form_c_field_y(U_field_x, U_field_y, D1_y, D2_y)
+
+        b_vector_x = c_field_x.flatten(order='f')
+        b_vector_y = c_field_y.flatten(order='f')
+
+        c_vector_x = forward_substitution(L, b_vector_x)
+        c_vector_y = forward_substitution(L, b_vector_y)
+
+        x_vector_x = backward_substitution(U,c_vector_x)
+        x_vector_y = backward_substitution(U,c_vector_y)
+
+        U_vector_x = x_vector_x
+        U_vector_y = x_vector_y
+
+        U_field_x = U_vector_x.reshape((Nodes_y, Nodes_x), order='F')
+        U_field_y = U_vector_y.reshape((Nodes_y, Nodes_x), order='F')
+
+        
+        U_field = np.stack((U_field_x,  U_field_y), axis =-1)
+       
+
+        t += timestep
+        t = round(t,3)
+
+        if t % 1 == 0 :
+
+             plot_vector_field(U_field)
+
+
+iteration()
+        
+
